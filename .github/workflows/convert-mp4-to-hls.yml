@@ -1,46 +1,51 @@
-name: Convert MP4 to HLS
+name: Convert MP4 → HLS and upload to R2
 
 on:
   workflow_dispatch:
     inputs:
       url:
+        description: "Public MP4 URL in R2 (e.g. https://pub‑…/lectures/2025/myvideo.mp4)"
         required: true
-        description: "Public MP4 URL from R2"
-      keyprefix:
-        required: true
-        description: "Where to upload the HLS output in R2 (e.g. lectures/2025/myvideo-hls)"
 
 jobs:
   convert:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ⬇️ Download MP4
-        run: |
-          curl -L "${{ github.event.inputs.url }}" -o input.mp4
+      - name: ⬇️  Download MP4
+        run: curl -L "${{ github.event.inputs.url }}" -o input.mp4
 
-      - name: 🧪 Convert MP4 to HLS (.m3u8)
+      - name: 🛠️  Install FFmpeg
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg file
+
+      - name: 🎬  Convert to HLS
         run: |
           mkdir output
-          ffmpeg -i input.mp4 -preset veryfast \
+          ffmpeg -i input.mp4 \
+            -preset veryfast \
             -vf "scale=w=1280:h=-2" \
             -c:a aac -b:a 128k \
             -c:v h264 -profile:v main -crf 20 -g 48 -keyint_min 48 \
             -sc_threshold 0 -b:v 2000k -maxrate 2000k -bufsize 4000k \
-            -f hls \
-            -hls_time 6 -hls_playlist_type vod \
+            -f hls -hls_time 6 -hls_playlist_type vod \
             -hls_segment_filename "output/segment_%03d.ts" \
             output/index.m3u8
 
-      - name: 📤 Upload to R2
+      - name: 🚀  Upload HLS files to R2 via Worker
         env:
-          BUCKET_UPLOAD_URL: https://upload-video.essyritesh.workers.dev
+          UPLOAD_WORKER: https://generate-upload-url.essyritesh.workers.dev
         run: |
+          # Derive the key prefix automatically from the input URL
+          raw_path=$(echo "${{ github.event.inputs.url }}" | sed -E 's#https://[^/]+/##')
+          key_prefix=$(echo "$raw_path" | sed -E 's/\.mp4$/-hls/')
+
           for file in output/*; do
             filename=$(basename "$file")
-            curl -X POST \
-              -H "Content-Type: $(file --mime-type -b "$file")" \
-              --data-binary "@$file" \
-              "${BUCKET_UPLOAD_URL}?key=${{ github.event.inputs.keyprefix }}/$filename"
-            echo "✅ Uploaded: $filename"
+            mime=$(file --mime-type -b "$file")
+            curl -sS -X POST -H "Content-Type: $mime" \
+                 --data-binary "@$file" \
+                 "$UPLOAD_WORKER?key=${key_prefix}/$filename"
+            echo "✅ Uploaded $filename"
           done
