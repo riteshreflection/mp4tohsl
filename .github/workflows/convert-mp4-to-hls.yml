@@ -1,51 +1,62 @@
-name: Convert MP4 → HLS and upload to R2
+name: Convert MP4 → HLS
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Public MP4 URL in R2 (e.g. https://pub‑…/lectures/2025/myvideo.mp4)"
         required: true
+      keyprefix:
+        required: true         # lectures/2025/video-hls
+      key:
+        required: true         # lectures/2025/video.mp4  (original)
 
 jobs:
-  convert:
+  hls:
     runs-on: ubuntu-latest
-
+    env:
+      STATUS_URL: https://generate-upload-url.essyritesh.workers.dev/   # Worker base
     steps:
-      - name: ⬇️  Download MP4
-        run: curl -L "${{ github.event.inputs.url }}" -o input.mp4
-
-      - name: 🛠️  Install FFmpeg
+      - name: Download MP4 via Worker (zero‑egress)
         run: |
-          sudo apt update
-          sudo apt install -y ffmpeg file
+          curl -L "${{ github.event.inputs.url }}" -o input.mp4
 
-      - name: 🎬  Convert to HLS
+      - name: Get duration (ms)
+        id: dur
         run: |
+          DURATION_MS=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 input.mp4 | awk '{printf "%.0f",$1*1000}')
+          echo "duration=$DURATION_MS" >> $GITHUB_OUTPUT
+
+      - name: Convert to HLS and stream progress to Worker
+        run: |
+          dur=${{ steps.dur.outputs.duration }}
+          echo "Total duration (ms): $dur"
           mkdir output
-          ffmpeg -i input.mp4 \
-            -preset veryfast \
-            -vf "scale=w=1280:h=-2" \
+          ffmpeg -i input.mp4 -preset veryfast \
             -c:a aac -b:a 128k \
             -c:v h264 -profile:v main -crf 20 -g 48 -keyint_min 48 \
-            -sc_threshold 0 -b:v 2000k -maxrate 2000k -bufsize 4000k \
-            -f hls -hls_time 6 -hls_playlist_type vod \
+            -hls_time 6 -hls_playlist_type vod \
             -hls_segment_filename "output/segment_%03d.ts" \
-            output/index.m3u8
+            -progress pipe:1 -nostats -f hls output/index.m3u8 |
+          while IFS='=' read -r k v; do
+            if [[ "$k" == "out_time_ms" ]]; then
+              pct=$(( v*100 / dur ))
+              curl -s -X PUT --data "$pct" \
+                "$STATUS_URL/?key=${{ github.event.inputs.key }}"
+            elif [[ "$k" == "progress" && "$v" == "end" ]]; then
+              curl -s -X PUT --data "done" \
+                "$STATUS_URL/?key=${{ github.event.inputs.key }}"
+            fi
+          done
 
-      - name: 🚀  Upload HLS files to R2 via Worker
+      - name: Upload HLS back to R2
         env:
-          UPLOAD_WORKER: https://generate-upload-url.essyritesh.workers.dev
+          UPLOAD_WORKER: https://generate-upload-url.essyritesh.workers.dev/
         run: |
-          # Derive the key prefix automatically from the input URL
-          raw_path=$(echo "${{ github.event.inputs.url }}" | sed -E 's#https://[^/]+/##')
-          key_prefix=$(echo "$raw_path" | sed -E 's/\.mp4$/-hls/')
-
           for file in output/*; do
-            filename=$(basename "$file")
-            mime=$(file --mime-type -b "$file")
-            curl -sS -X POST -H "Content-Type: $mime" \
-                 --data-binary "@$file" \
-                 "$UPLOAD_WORKER?key=${key_prefix}/$filename"
-            echo "✅ Uploaded $filename"
+            fn=$(basename "$file")
+            curl -s -X POST -H "Content-Type: $(file --mime-type -b "$file")" \
+                 --data-binary @"$file" \
+                 "$UPLOAD_WORKER?key=${{ github.event.inputs.keyprefix }}/$fn"
+            echo "Uploaded $fn"
           done
