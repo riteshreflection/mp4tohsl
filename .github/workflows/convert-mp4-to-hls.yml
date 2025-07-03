@@ -39,6 +39,6 @@ jobs:
             curl -X POST \
               -H "Content-Type: $(file --mime-type -b "$file")" \
               --data-binary "@$file" \
-              "https://generate-upload-url.workers.dev/?key=${{ github.event.inputs.keyprefix }}/$filename"
+              "https://generate-upload-url.essyritesh.workers.dev/?key=${{ github.event.inputs.keyprefix }}/$filename"
             echo "✅ Uploaded: $filename"
           done
