@@ -1,0 +1,44 @@
+name: Convert MP4 to HLS and Upload to Cloudflare R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Public URL of the .mp4 file in R2'
+        required: true
+      keyprefix:
+        description: 'Path in R2 to store HLS (e.g. lectures/2025/myvideo-hls)'
+        required: true
+
+jobs:
+  convert-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Download MP4 from R2
+        run: |
+          curl -L "${{ github.event.inputs.url }}" -o input.mp4
+
+      - name: 🛠️ Install FFmpeg
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg
+
+      - name: 🎬 Convert MP4 to HLS
+        run: |
+          mkdir output
+          ffmpeg -i input.mp4 \
+            -profile:v baseline -level 3.0 -start_number 0 \
+            -hls_time 6 -hls_list_size 0 -f hls \
+            output/index.m3u8
+
+      - name: 🚀 Upload HLS files to R2 via Worker
+        run: |
+          for file in output/*; do
+            filename=$(basename "$file")
+            curl -X POST \
+              -H "Content-Type: $(file --mime-type -b "$file")" \
+              --data-binary "@$file" \
+              "https://generate-upload-url.workers.dev/?key=${{ github.event.inputs.keyprefix }}/$filename"
+            echo "✅ Uploaded: $filename"
+          done
