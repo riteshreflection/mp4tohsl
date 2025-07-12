@@ -1,62 +1,83 @@
-name: Convert MP4 → HLS
+# ============================================================================
+#  GitHub Actions Workflow: Transcode MP4 ➜ single‑file CMAF‑DASH and upload
+#  to Cloudflare R2 (S3‑compatible) in just a handful of PUT operations.
+# ----------------------------------------------------------------------------
+#  • Trigger manually from the Actions tab (workflow_dispatch) and provide:
+#       • src           – path to the .mp4 in the repo (e.g. lectures/week1.mp4)
+#       • output_prefix – key prefix in your R2 bucket (e.g. lectures/week1)
+#  • Secrets you must create in the repo:
+#       • R2_ACCESS_KEY_ID       – Cloudflare R2 access key
+#       • R2_SECRET_ACCESS_KEY   – Cloudflare R2 secret key
+#       • R2_BUCKET              – Bucket name (no s3://, just the name)
+#       • R2_ENDPOINT            – Endpoint URL (e.g. https://<accountid>.r2.cloudflarestorage.com)
+#       • R2_PUBLIC_DOMAIN       – (optional) CDN domain to build playback URL
+# ============================================================================
+
+name: "Transcode MP4 to single‑file DASH and upload to Cloudflare R2"
 
 on:
   workflow_dispatch:
     inputs:
-      url:
+      src:
+        description: "Relative path to the .mp4 file (e.g. lectures/week1.mp4)"
         required: true
-      keyprefix:
-        required: true         # lectures/2025/video-hls
-      key:
-        required: true         # lectures/2025/video.mp4  (original)
+        type: string
+      output_prefix:
+        description: "R2 key prefix (e.g. lectures/week1)"
+        required: true
+        type: string
+
+env:
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
 jobs:
-  hls:
+  build-and-upload:
     runs-on: ubuntu-latest
-    env:
-      STATUS_URL: https://generate-upload-url.essyritesh.workers.dev/   # Worker base
+
     steps:
-      - name: Download MP4 via Worker (zero‑egress)
-        run: |
-          curl -L "${{ github.event.inputs.url }}" -o input.mp4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Get duration (ms)
-        id: dur
+      - name: Install FFmpeg & AWS CLI
         run: |
-          DURATION_MS=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 input.mp4 | awk '{printf "%.0f",$1*1000}')
-          echo "duration=$DURATION_MS" >> $GITHUB_OUTPUT
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg awscli
 
-      - name: Convert to HLS and stream progress to Worker
+      - name: Create output directory
+        run: mkdir -p dash_out
+
+      - name: Transcode to single‑file CMAF‑DASH
+        shell: bash
         run: |
-          dur=${{ steps.dur.outputs.duration }}
-          echo "Total duration (ms): $dur"
-          mkdir output
-          ffmpeg -i input.mp4 -preset veryfast \
+          INPUT="${{ github.event.inputs.src }}"
+          BASENAME=$(basename "${INPUT%.*}")          # e.g. week1
+
+          # Optional: scale/bit‑rate for additional renditions. Add more blocks
+          # with different -vf scale and -b:v, then combine using MP4Box if needed.
+
+          ffmpeg -i "$INPUT" \
+            -c:v libx264 -crf 22 -preset fast \
             -c:a aac -b:a 128k \
-            -c:v h264 -profile:v main -crf 20 -g 48 -keyint_min 48 \
-            -hls_time 6 -hls_playlist_type vod \
-            -hls_segment_filename "output/segment_%03d.ts" \
-            -progress pipe:1 -nostats -f hls output/index.m3u8 |
-          while IFS='=' read -r k v; do
-            if [[ "$k" == "out_time_ms" ]]; then
-              pct=$(( v*100 / dur ))
-              curl -s -X PUT --data "$pct" \
-                "$STATUS_URL/?key=${{ github.event.inputs.key }}"
-            elif [[ "$k" == "progress" && "$v" == "end" ]]; then
-              curl -s -X PUT --data "done" \
-                "$STATUS_URL/?key=${{ github.event.inputs.key }}"
-            fi
-          done
+            -seg_duration 6 \
+            -use_template 1 -use_timeline 1 -single_file 1 \
+            -init_seg_name init.mp4 \
+            -media_seg_name media.m4s \
+            -adaptation_sets "id=0,streams=v id=1,streams=a" \
+            -f dash "dash_out/${BASENAME}.mpd"
 
-      - name: Upload HLS back to R2
-        env:
-          UPLOAD_WORKER: https://generate-upload-url.essyritesh.workers.dev/
+      - name: Upload DASH package to Cloudflare R2
+        shell: bash
         run: |
-          for file in output/*; do
-            fn=$(basename "$file")
-            curl -s -X POST -H "Content-Type: $(file --mime-type -b "$file")" \
-                 --data-binary @"$file" \
-                 "$UPLOAD_WORKER?key=${{ github.event.inputs.keyprefix }}/$fn"
-            echo "Uploaded $fn"
-          done
+          OUTPUT_PREFIX="${{ github.event.inputs.output_prefix }}"
+          aws s3 cp dash_out "s3://${R2_BUCKET}/${OUTPUT_PREFIX}/" --recursive --endpoint-url "${R2_ENDPOINT}"
+
+      - name: Display playback URL
+        if: ${{ secrets.R2_PUBLIC_DOMAIN != '' }}
+        shell: bash
+        run: |
+          BASENAME=$(basename "${{ github.event.inputs.src }}" .mp4)
+          echo "\n🎉  Your DASH stream is ready:"
+          echo "https://${{ secrets.R2_PUBLIC_DOMAIN }}/${{ github.event.inputs.output_prefix }}/${BASENAME}.mpd"
